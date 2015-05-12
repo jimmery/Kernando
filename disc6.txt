@@ -1,0 +1,151 @@
+Lab 2. Ramdisk / device driver
+
+in-memory block device. 
+  can store data. read/write. 
+
+file stored in /dev/
+  open(device file)
+  everything in Linux is a file. using a device driver is the same as opening a file. 
+
+We will be using Linux 2.6.18, which is a use of cs111.iso in the Ubuntu thing from Minilab 1. 
+
+What is the requirement for lab 2? 
+1. read/write to the device file. 
+   support read/write from / to Ramdisk
+2. synchronization. 
+   race conditions may exist when multiple processes want to read/write to device. 
+   we need to implement some locking. 
+
+So for the first part, we need to look at: 
+struct request in Linux 2.6.18. 
+  this will be in blkdev.h. 
+  for different OS, blkdev.h will be different (even for different Linux versions!)
+  go to http://lxr.linux.no/#linux+v2.6.18/
+    search for blkdev.h
+    look for struct request definition in this file. 
+  if you understnad how to find struct request, part 1 is relatively straightforward. 
+
+Some additional points: 
+  memcpy
+  copy_from_user, copy_to_user (used in lab 3, DO NOT USE FOR THIS PART)
+
+// if we have time we will talk about number 1. 
+
+unsinged int requestType = rq_data_dir(req);
+// we must compute the offset to the buffer. 
+// the we run memcpy to read/write to the driver. . 
+int8_t* ptr = d->data + (req->sector)*SECTOR_SIZE;
+
+if ( requestType == READ ) {
+  memcpy(req->buffer, ptr, req->current_nr_sectors * SECTOR_SIZE);
+  // copies current_nr_sectors sectors into req->buffer. 
+} else if ( requestType = WRITE ) {
+  ...
+}
+
+
+2. Implment Locking
+
+We need to implement certain operations. 
+1. OSPRDIOCACQUIRE // blocking approach. 
+2. OSPRDIOCRELEASE // releases lock. 
+3. OSPRDIOCTRYACQUIRE // busy-loop approach. 
+
+we want to implement two types of locks. 
+read lock and write lock. (handled differently)
+  read lock is rather straightforward. read locks just need to wait for write locks to finish. 
+  write lock is slightly more complicated. you must block until read and write locks are finished. 
+
+Let's say that there are three processes that want the write lock, P1, P2, and P3. 
+If P2 gets the lock, P1 and P3 are put into a queue and when P2 is finished, we give the lock to P1. 
+First come first served order. 
+  The problem is that you must wake up the entire queue (I guess). How do we implement FCFS then? 
+  Assign a ticket number to each process. 
+    Only when the process has the ticket number, we will give the lock to the process. 
+    This must be done atomically. 
+    Of course, we need to have tickets given sequentially. 
+  How do we assign this ticket number? 
+    We need some sort of global variable to assign ticket numbers. 
+    Problem: Atomic assignment and Race Conditions. 
+
+ticket_head = 0; ticket_tail = 0; // global variables. 
+// head is the "next ticket to be given", tail is "process currently processing"
+my_ticket = ticket_head; 
+ticket_head++;
+
+If this process can be done atomically, this is good. 
+How do we do this atomically? 
+
+Once this is implemented, we can just use the idea given above. 
+
+int wait_event_interruptible(wait_queue_head_t q, CONDITION); 
+Blocks the current task on a wait queue until CONDITION becomes true. 
+  in our case, CONDITION can be (my_ticket == ticket_tail). 
+
+In our example. 
+P2 obtains the lock. 
+P2 finishes its task. 
+P2 releases the lock by: 
+  incrementing ticket_tail. 
+  wake_up_all(q)
+
+Therefore, in a process: 
+
+int wait_event_interruptible(wait_queue_head_t q, (my_ticket == ticket_tail)); 
+// all processes get stuck at this point, where they are put into the sleep state. 
+// when process is awaken, it resumes at this point. 
+// another single process can continue from this point. 
+
+And... that's it. :D
+(wait what?!)
+
+This is a very high level description. There are multiple tricks involved. 
+
+Problems. 
+CONDITION is (my_ticket == ticket_tail) is not sufficient. 
+
+Deadlock condition: 
+1. What if P1 is killed before P2 completes. 
+P3 will still have ticket 2 and return to sleep, but no process will ever increment tail again. 
+  => deadlock. 
+we increment ticket_tail by 1 because it assumes that P1 is still alive. 
+
+P2 will have to actually make a decision as to what value it increments ticket_tail to. 
+
+maintain another global variable: 
+exited_ticket {1}
+this is implemented in the osprd_close_last() function. 
+
+Essentially, P2 will increment ticket_tail until it's not in exited_ticket. 
+
+we look at wait_event_interruptible returns 0 if CONDITION is true. 
+if CONDITION is false, it puts the task on the wait queue and blocks it. 
+if the task is interrupted before CONDITION becomes true, returns -ERESTARTSYS. 
+
+we also have to check for the CONDITION for readlocks. 
+
+Actual claim locks: 
+file -> f_flagsl = F_OSPRD_LOCKED;
+addToList(&(d->writeLockPids), current->pid); 
+
+another CONDITION: d->writeLockPids->size == 0
+
+kmalloc will be used to create these lists. 
+
+don't use wait_event_interruptible in TRYACQUIRE.
+
+
+DeadLock case: 
+1. Waiting on yourself. 
+  Look at the writeLockPids. 
+2. you really don't have to test any other dead lock cases. 
+  for a more advanced deadlock test cases: 
+  construct dependency graph among processes waiting on Ramdisk. 
+    if there is a cycle in the dependenc graph, then there's a dead lock. 
+    this will be for extra credit. 
+
+
+
+
+
+
